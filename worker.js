@@ -6,20 +6,23 @@ const path = require("path");
 const mongoose = require("mongoose");
 const deepgram = require("deepgram");
 const { Video } = require("./models/video.model");
+require("dotenv").config();
+const { MONGO_URI } = process.env;
 
 // Deepgram API key
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY; // Replace with your Deepgram API key
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 
 // Initialize Deepgram client
 const client = deepgram({ apiKey: DEEPGRAM_API_KEY });
 
-// Connect to MongoDB (make sure MongoDB is running)
-mongoose.connect("mongodb://localhost:27017/mydb", {
+mongoose.connect(MONGO_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
 });
 
 async function performTranscription(videoId, filePath) {
+  let connectionOpen = true; //  track connection
+
   try {
     console.log(`Transcribing audio for video with ID: ${videoId}`);
 
@@ -36,6 +39,10 @@ async function performTranscription(videoId, filePath) {
         { new: true }
       );
 
+      // Close the MongoDB connection
+      await mongoose.connection.close();
+      connectionOpen = false;
+
       // Notify the main thread that transcription is completed
       parentPort.postMessage("transcription_completed");
     } else {
@@ -43,6 +50,11 @@ async function performTranscription(videoId, filePath) {
     }
   } catch (error) {
     console.error("Error performing transcription:", error);
+  } finally {
+    if (connectionOpen) {
+      // Close the MongoDB connection if it's still open (in case of an error)
+      await mongoose.connection.close();
+    }
   }
 }
 
