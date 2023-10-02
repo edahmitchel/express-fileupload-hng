@@ -2,14 +2,56 @@ const express = require("express");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
+const amqp = require("amqplib");
 const connectDB = require("./db");
 const { Video } = require("./models/video.model");
-
+const cors = require("cors");
 const swaggerJsdoc = require("swagger-jsdoc");
 const swaggerUi = require("swagger-ui-express");
 
+const { v4: uuid } = require("uuid");
+const { Worker } = require("worker_threads");
 require("dotenv").config();
+// Connect to RabbitMQ
+const rabbitmqUrl = process.env.RABBIT_Url;
+const startRecordingQueue = "startRecordingQueue";
+async function setupRabbitMQ() {
+  const connection = await amqp.connect(rabbitmqUrl);
+  const channel = await connection.createChannel();
+
+  // Declare a queue for sending start recording messages
+  await channel.assertQueue(startRecordingQueue, { durable: true });
+
+  // Process incoming messages from the queue
+  channel.consume(startRecordingQueue, async (message) => {
+    const messageContent = JSON.parse(message.content.toString());
+
+    if (messageContent.startTranscription) {
+      // Start the worker thread when a "start transcription" message is received
+      startWorker(messageContent.id, messageContent.filename);
+    }
+
+    // Acknowledge the message to remove it from the queue
+    channel.ack(message);
+  });
+}
+//  start the worker thread
+function startWorker(videoId, filename) {
+  const worker = new Worker("./worker.js", {
+    workerData: { videoId, filename },
+  });
+
+  worker.on("message", (message) => {
+    if (message === "transcription_completed") {
+      // Transcription is completed, close the worker thread
+      worker.terminate();
+    }
+  });
+}
+
 const app = express();
+app.use(cors());
+app.use(express.urlencoded({ extended: true }));
 const port = process.env.PORT || 3000;
 const appUrl = process.env.APP_URL || "http://localhost:" + port;
 const swaggerOptions = {
@@ -257,7 +299,12 @@ app.get("/video/:id", async (req, res) => {
       return res.status(404).json({ error: "Video not found" });
     }
     const fileUrl = appUrl + "/recordings/" + video.filename;
-    res.status(201).json({ title: video.filename, fileUrl });
+
+    res.status(201).json({
+      title: video.filename,
+      fileUrl,
+      transcription: video?.transcription,
+    });
   } catch (error) {
     console.error("Error serving file:", error);
     res.status(500).json({ error: "File retrieval failed" });
@@ -298,6 +345,7 @@ app.get("/video", async (req, res) => {
       fileUrl: `${
         process.env.APP_URL || "http://localhost:" + port
       }/recordings/${video.filename}`,
+      transcription: video?.transcription,
     }));
 
     res.json(uploadedVideos);
@@ -306,6 +354,165 @@ app.get("/video", async (req, res) => {
     res.status(500).json({ error: "File list retrieval failed" });
   }
 });
+
+/**
+ * @swagger
+ * /start-recording:
+ *   post:
+ *     summary: Start recording a video
+ *     tags: [Videos]
+ *     responses:
+ *       200:
+ *         description: Recording started successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 id:
+ *                   type: string
+ *                   description: ID of the newly started recording
+ *                 filename:
+ *                   type: string
+ *                   description: Filename of the video
+ *       500:
+ *         description: Error starting recording
+ */
+
+app.post("/start-recording", async (req, res) => {
+  try {
+    // Generate a unique filename for the video
+    const filename = `${uuid()}.webm`;
+
+    // Create an empty video file in the "static" folder
+    const videoFilePath = path.join(__dirname, "uploads", filename);
+    fs.writeFileSync(videoFilePath, Buffer.alloc(0));
+
+    // Save information about the video in MongoDB
+    const videoDoc = await Video.create({ filename });
+
+    res.status(200).json({ id: videoDoc._id, filename });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Error starting recording" });
+  }
+});
+
+/**
+ * @swagger
+ * /append-chunk/{id}:
+ *   post:
+ *     summary: Append a video chunk to a recording
+ *     tags: [Videos]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         description: The ID of the video recording
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               chunkData:
+ *                 type: string
+ *                 description: Base64-encoded video chunk data
+ *             required:
+ *               - chunkData
+ *     responses:
+ *       200:
+ *         description: Video chunk appended successfully
+ *       404:
+ *         description: Video not found
+ *       500:
+ *         description: Error appending video chunk
+ */
+
+app.post("/append-chunk/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { chunkData } = req.body;
+
+    // Find the video document by ID
+    const videoDoc = await Video.findById(id);
+
+    if (!videoDoc) {
+      return res.status(404).json({ error: "Video not found" });
+    }
+
+    // Append the received chunk data to the video file
+    const videoFilePath = path.join(__dirname, "uploads", videoDoc.filename);
+    fs.appendFileSync(videoFilePath, Buffer.from(chunkData, "base64"));
+
+    res.status(200).json({ message: "Chunk appended successfully" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Error appending chunk" });
+  }
+});
+
+/**
+ * @swagger
+ * /end-recording/{id}:
+ *   post:
+ *     summary: Finish recording and start transcription
+ *     tags: [Videos]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         description: The ID of the video recording
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Recording finished and transcription started
+ *       404:
+ *         description: Video not found
+ *       500:
+ *         description: Error finishing recording and starting transcription
+ */
+
+app.post("/end-recording/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Find the video document by ID
+    const videoDoc = await Video.findById(id);
+
+    if (!videoDoc) {
+      return res.status(404).json({ error: "Video not found" });
+    }
+
+    // Publish  "start transcription"
+    const channel = await setupRabbitMQ();
+    await channel.sendToQueue(
+      startRecordingQueue,
+      Buffer.from(
+        JSON.stringify({
+          id: videoDoc._id,
+          filename: videoDoc.filename,
+          startTranscription: true,
+        })
+      ),
+      { persistent: true }
+    );
+
+    res
+      .status(200)
+      .json({ message: "Recording finished and transcription started" });
+  } catch (error) {
+    console.error(error);
+    res
+      .status(500)
+      .json({ error: "Error finishing recording and starting transcription" });
+  }
+});
+
 app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(specs));
 
 app.listen(port, () => {

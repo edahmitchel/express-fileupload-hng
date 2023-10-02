@@ -5,6 +5,7 @@ const videoSchema = new mongoose.Schema({
   mimetype: String,
   filename: String,
   size: Number,
+  transcription: String,
 });
 
 // Create the Video model using the videoSchema
